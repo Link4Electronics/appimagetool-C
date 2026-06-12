@@ -1,0 +1,332 @@
+name: CI
+
+on:
+  push:
+    tags:
+    - '*'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: write
+
+jobs:
+  # ------------------------------------------------------------------ #
+  #  Alpine / musl builds for all QEMU-capable architectures           #
+  # ------------------------------------------------------------------ #
+  build_static:
+    name: appimagetool-${{ matrix.arch }}
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        arch: [x86_64, aarch64, arm32v7, i386, ppc64le, riscv64, loongarch64, s390x]
+        include:
+          - arch: x86_64
+            platform: linux/amd64
+            image: alpine:latest
+          - arch: aarch64
+            platform: linux/arm64
+            image: arm64v8/alpine:latest
+          - arch: arm32v7
+            platform: linux/arm/v7
+            image: arm32v7/alpine:latest
+          - arch: i386
+            platform: linux/386
+            image: i386/alpine:latest
+          - arch: ppc64le
+            platform: linux/ppc64le
+            image: ppc64le/alpine:latest
+          - arch: riscv64
+            platform: linux/riscv64
+            image: riscv64/alpine:latest
+          - arch: loongarch64
+            platform: linux/loong64
+            image: loongarch64/alpine:3.21
+          - arch: s390x
+            platform: linux/s390x
+            image: s390x/alpine:latest
+    steps:
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v3
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build static binary
+        run: |
+          docker run --rm \
+            -v "${{ github.workspace }}:/root" \
+            -w /root \
+            --platform=${{ matrix.platform }} \
+            ${{ matrix.image }} \
+            sh -c "
+              set -ex
+              N=\$(nproc)
+
+              # QEMU user-mode TLS workaround: switch to HTTP repos
+              sed -i 's|https://|http://|g' /etc/apk/repositories 2>/dev/null || true
+
+              # Install build tools (no static library packages)
+              apk add --no-cache \
+                gcc musl-dev cmake make linux-headers \
+                bash binutils file findutils \
+                pkgconfig git perl autoconf automake libtool
+
+              # ----------------------------------------------------------
+              #  Build all static libraries from source
+              # ----------------------------------------------------------
+
+              # zlib 1.3.1
+              git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
+              cd /tmp/zlib
+              ./configure --static --prefix=/usr
+              make -j\$N
+              make install
+              cd /root
+
+              # OpenSSL 3.4.1
+              git clone --depth 1 --branch openssl-3.4.1 https://github.com/openssl/openssl.git /tmp/openssl
+              cd /tmp/openssl
+              if [ \"\$(getconf LONG_BIT 2>/dev/null)\" = 32 ] && [ \"\$(uname -m)\" = x86_64 ]; then
+                ./Configure linux-x86 no-shared --prefix=/usr --libdir=lib
+              elif [ \"\$(uname -m)\" = armv7l ]; then
+                ./Configure linux-armv4 no-shared --prefix=/usr --libdir=lib
+              elif [ \"\$(uname -m)\" = ppc64le ]; then
+                ./Configure linux-ppc64le no-shared --prefix=/usr --libdir=lib
+              else
+                ./config no-shared --prefix=/usr --libdir=lib
+              fi
+              make -j\$N
+              make install_sw
+              cd /root
+
+              # nghttp2 1.64.0
+              git clone --depth 1 --branch v1.64.0 https://github.com/nghttp2/nghttp2.git /tmp/nghttp2
+              cd /tmp/nghttp2
+              autoreconf -fi
+              ./configure --enable-static --disable-shared --prefix=/usr
+              make -j\$N
+              make install
+              cd /root
+
+              # c-ares 1.34.5
+              git clone --depth 1 --branch v1.34.5 https://github.com/c-ares/c-ares.git /tmp/cares
+              cd /tmp/cares
+              cmake -B build -DCMAKE_BUILD_TYPE=Release \\
+                -DCMAKE_INSTALL_PREFIX=/usr \\
+                -DCARES_STATIC=ON -DCARES_SHARED=OFF
+              cmake --build build -j\$N
+              cmake --install build
+              cd /root
+
+              # libcurl 8.13.0
+              git clone --depth 1 --branch curl-8_13_0 https://github.com/curl/curl.git /tmp/curl
+              cd /tmp/curl
+              autoreconf -fi
+              ./configure --disable-shared --enable-static --prefix=/usr \\
+                --with-openssl --without-libpsl --without-libidn2 \
+                --without-brotli --without-zstd \
+                --disable-ldap --disable-ldaps
+              make -j\$N
+              make install
+              cd /root
+
+              # ----------------------------------------------------------
+              #  Build appimagetool (fully static, no dynamic fallback)
+              # ----------------------------------------------------------
+              cmake -S . -B build \\
+                -DCMAKE_BUILD_TYPE=MinSizeRel \\
+                -DAPPIMAGETOOL_STATIC=ON
+              cmake --build build -j\$N
+
+              BIN=\"appimagetool-${{ matrix.arch }}\"
+              cp build/appimagetool /root/\${BIN}
+              strip --strip-all /root/\${BIN}
+            "
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimagetool-${{ matrix.arch }}
+          path: appimagetool-${{ matrix.arch }}
+
+  # ------------------------------------------------------------------ #
+  #  ppc64 big-endian (Arch POWER, glibc, ELFv2, 64KB pages)           #
+  # ------------------------------------------------------------------ #
+  build_ppc64:
+    name: appimagetool-ppc64
+    runs-on: ubuntu-latest
+    steps:
+      - name: Install QEMU user-mode
+        run: |
+          sudo apt update && sudo apt install -y qemu-user-static binfmt-support
+
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Build in QEMU chroot (Arch POWER)
+        run: |
+          # Extract Arch POWER rootfs
+          docker create --name ppc64src kth5/archpower:latest-ppc64 /bin/true
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs
+          docker export ppc64src | sudo tar xf - -C ${{ github.workspace }}/ppc64-rootfs
+          docker rm ppc64src
+
+          # Fix pacman for chroot
+          sudo rm -rf ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg/*
+          sudo sed -i 's/^DownloadUser/#DownloadUser/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^#DisableSandbox/DisableSandbox/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^SigLevel.*/SigLevel = Never/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo sed -i 's/^LocalFileSigLevel.*/LocalFileSigLevel = Never/' ${{ github.workspace }}/ppc64-rootfs/etc/pacman.conf
+          sudo touch ${{ github.workspace }}/ppc64-rootfs/etc/mtab
+
+          # Mount /proc and tmpfs for pacman cache
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs/proc \
+                        ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg
+          sudo mount --bind /proc ${{ github.workspace }}/ppc64-rootfs/proc
+          sudo mount -t tmpfs -o size=3G tmpfs ${{ github.workspace }}/ppc64-rootfs/var/cache/pacman/pkg
+
+          # Copy QEMU static binary and DNS config
+          sudo cp /usr/bin/qemu-ppc64-static ${{ github.workspace }}/ppc64-rootfs/usr/bin/
+          sudo cp /etc/resolv.conf ${{ github.workspace }}/ppc64-rootfs/etc/
+
+          # Copy source
+          sudo mkdir -p ${{ github.workspace }}/ppc64-rootfs/build
+          sudo cp -r src ${{ github.workspace }}/ppc64-rootfs/build/
+          sudo cp CMakeLists.txt ${{ github.workspace }}/ppc64-rootfs/build/
+
+          # Build inside chroot
+          sudo chroot ${{ github.workspace }}/ppc64-rootfs /bin/bash -c "
+            set -ex
+            pacman -Sy --noconfirm
+            pacman -Sw --noconfirm gcc make cmake pkgconf curl zlib openssl git autoconf automake libtool perl
+
+            # Extract downloaded packages manually (pacman -S fails under QEMU user-mode due to statvfs)
+            for pkg in /var/cache/pacman/pkg/*.pkg.tar.*; do
+              tar --zstd -xf \"\$pkg\" -C / 2>/dev/null || tar -xf \"\$pkg\" -C / 2>/dev/null || true
+            done
+
+            # Build all static libs from source
+            N=\$(nproc)
+
+            # zstd 1.5.7
+            git clone --depth 1 --branch v1.5.7 https://github.com/facebook/zstd.git /tmp/zstd
+            make -C /tmp/zstd/lib libzstd.a -j\$N
+            cp /tmp/zstd/lib/libzstd.a /usr/lib/
+
+            # zlib 1.3.1
+            git clone --depth 1 --branch v1.3.1 https://github.com/madler/zlib.git /tmp/zlib
+            cd /tmp/zlib
+            ./configure --static --prefix=/usr
+            make -j\$N
+            make install
+            cp libz.a /usr/lib/
+            cd /build
+
+            # OpenSSL 3.4.1
+            git clone --depth 1 --branch openssl-3.4.1 https://github.com/openssl/openssl.git /tmp/openssl
+            cd /tmp/openssl
+            if [ \"\$(getconf LONG_BIT 2>/dev/null)\" = 32 ] && [ \"\$(uname -m)\" = x86_64 ]; then
+              ./Configure linux-x86 no-shared --prefix=/usr --libdir=lib
+            elif [ \"\$(uname -m)\" = armv7l ]; then
+              ./Configure linux-armv4 no-shared --prefix=/usr --libdir=lib
+            elif [ \"\$(uname -m)\" = ppc64 ]; then
+              ./Configure linux-ppc64 no-shared --prefix=/usr --libdir=lib
+            else
+              ./config no-shared --prefix=/usr --libdir=lib
+            fi
+            make -j\$N
+            make install_sw
+            cd /build
+
+            # nghttp2 1.64.0
+            git clone --depth 1 --branch v1.64.0 https://github.com/nghttp2/nghttp2.git /tmp/nghttp2
+            cd /tmp/nghttp2
+            autoreconf -fi
+            ./configure --enable-static --disable-shared --prefix=/usr
+            make -j\$N
+            make install
+            cd /build
+
+            # c-ares 1.34.5
+            git clone --depth 1 --branch v1.34.5 https://github.com/c-ares/c-ares.git /tmp/cares
+            cd /tmp/cares
+            cmake -B build -DCMAKE_BUILD_TYPE=Release \\
+              -DCMAKE_INSTALL_PREFIX=/usr \\
+              -DCARES_STATIC=ON -DCARES_SHARED=OFF
+            cmake --build build -j\$N
+            cmake --install build
+            cd /build
+
+            # libcurl 8.13.0
+            git clone --depth 1 --branch curl-8_13_0 https://github.com/curl/curl.git /tmp/curl
+            cd /tmp/curl
+            autoreconf -fi
+            ./configure --disable-shared --enable-static --prefix=/usr \
+              --with-openssl --without-libpsl --without-libidn2 \
+              --without-brotli --without-zstd \
+              --disable-ldap --disable-ldaps
+            make -j\$N
+            make install
+            cd /build
+
+            # Build appimagetool (fully static, no dynamic fallback)
+            cmake -S . -B build \\
+              -DCMAKE_BUILD_TYPE=MinSizeRel \\
+              -DAPPIMAGETOOL_STATIC=ON
+            cmake --build build -j\$N
+
+            cp build/appimagetool /appimagetool-ppc64
+            strip --strip-all /appimagetool-ppc64 2>/dev/null || true
+          "
+
+          sudo cp ${{ github.workspace }}/ppc64-rootfs/appimagetool-ppc64 .
+          sudo chown $(id -u):$(id -g) appimagetool-ppc64 2>/dev/null || true
+
+      - name: Upload artifacts
+        uses: actions/upload-artifact@v4
+        with:
+          name: appimagetool-ppc64
+          path: appimagetool-ppc64*
+
+  # ------------------------------------------------------------------ #
+  #  Release                                                            #
+  # ------------------------------------------------------------------ #
+  release:
+    name: release
+    if: startsWith(github.ref, 'refs/tags/')
+    needs: [build_static, build_ppc64]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: /tmp/artifacts
+
+      - name: Collect files
+        run: |
+          find /tmp/artifacts -type f -exec cp -v {} . \;
+          ls -la appimagetool-*
+
+      - name: Generate checksums
+        run: |
+          for f in appimagetool-*; do
+            sha256sum "$f" > "$f.sha256"
+          done
+
+      - name: Create release archive
+        run: |
+          mkdir -p release
+          cp appimagetool-* release/
+          tar -cJvf appimagetool-all.tar.xz release/
+
+      - name: Release
+        uses: softprops/action-gh-release@v1
+        with:
+          files: |
+            appimagetool-*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

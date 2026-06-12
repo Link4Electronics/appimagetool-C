@@ -1,0 +1,7 @@
+build*/
+dist/
+.vscode
+*.o
+*.obj
+*.exe
+appimagetool-*
